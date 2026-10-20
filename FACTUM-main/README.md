@@ -54,17 +54,7 @@ This is the most critical step. Our method requires a modified version of the Hu
 uv pip install -e transformers
 ```
 
-### Step 3: Configure Paths
-Before running the code, you must verify that the file paths in our script matches your local machine's setup. Please open the following file and edit the paths as needed:
-
-1. ``citation_token_detect_long.py``
-
-Check and update the directories for the following:
-- The location of your input dataset. We used the datasets stored at ``~/FACTUM-main/dataset/NeuCLIR24``
-- The location where your Hugging Face models are stored. We used models stored in our ``/exp/{user_id}/.cache/huggingface/hub`` directory. Make sure to redirect your huggingface cache path to this directory, otherwise it will be stored in your home directory. 
-- The output directory where you want to store the results. We stored our results of the scores here: ``~/FACTUM-main/scale/results/llama3.1-8b_neuclir24`` and here: ``~/FACTUM-main/scale/results/llama3.2-3b_neuclir24``. They were too big to be stored here on GitHub so the folders are empty now. 
-
-### Step 4: Execute the Scoring Job
+### Step 3: Execute the Scoring Job
 Once the environment is set up and the paths are configured, you can run the main scoring pipeline with your Slurm batch script. For example:
 
 ```bash

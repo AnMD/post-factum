@@ -18,6 +18,7 @@ import gc
 # Configuration
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.set_float32_matmul_precision("high")
+FACTUM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Initial environment and system info logging
 print(f"Hostname: {platform.node()}  Date: {datetime.datetime.now().strftime('%c')}")
@@ -62,19 +63,25 @@ parser.add_argument(
 parser.add_argument(
     "--save_dir",
     type=str,
-    default="/exp/mdassen/redeep/ReDEeP-ICLR-main/ReDeEP/log/llama3.2-3b_scale/not_rel/all_scores_scale_numonly.jsonl",
+    default=os.path.join(
+        FACTUM_DIR, "scale", "results", "llama3.2-3b_neuclir24", "all_scores_scale_numonly.jsonl"
+    ),
     help="Directory to save the output log files.",
 )
 parser.add_argument(
     "--response_path",
     type=str,
-    default="/exp/mdassen/redeep/ReDEeP-ICLR-main/dataset/scale/NeuCLIR24/citation/numonly_3.2-3b_response.jsonl",
+    default=os.path.join(
+        FACTUM_DIR, "dataset", "NeuCLIR24", "llama3.2-3b_neuclir24_response.jsonl"
+    ),
     help="Path to the .jsonl file containing model responses.",
 )
 parser.add_argument(
     "--source_info_path",
     type=str,
-    default="/exp/mdassen/redeep/ReDEeP-ICLR-main/dataset/scale/NeuCLIR24/citation/numonly_3.2-3b_source_info.jsonl",
+    default=os.path.join(
+        FACTUM_DIR, "dataset", "NeuCLIR24", "llama3.2-3b_neuclir24_source_info.jsonl"
+    ),
     help="Path to the .jsonl file containing source info and prompts.",
 )
 parser.add_argument(
@@ -95,13 +102,13 @@ print(
     f"[INFO] Starting unified scoring script with model: {args.model_name}, dataset: {args.dataset}"
 )
 
-# Data loading and model setup: make sure to change the directories to downloaded model
+# Data loading and model setup
 if args.model_name == "llama3.2-3b":
-    model_path = "/exp/mdassen/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.2-3B-Instruct"
+    model_path = "meta-llama/Llama-3.2-3B-Instruct"
 elif args.model_name == "llama3.1-8b":
-    model_path = "/exp/mdassen/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct"
+    model_path = "meta-llama/Llama-3.1-8B-Instruct"
 elif args.model_name == "llama2-7b":
-    model_path = "/exp/mdassen/.cache/huggingface/hub/models--meta-llama--Meta-Llama-2-7B-chat-hf"
+    model_path = "meta-llama/Llama-2-7b-chat-hf"
 else:
     ValueError(
         f"[ERROR] No model was found, adjust the 'model_path' to your downloaded model path"

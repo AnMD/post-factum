@@ -1,9 +1,12 @@
+import os
 import pandas as pd
 from sklearn.metrics import cohen_kappa_score
 
 
 def calculate_stats():
-    df = pd.read_csv("human_annotations.csv")
+    df = pd.read_csv(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_annotations.csv")
+    )
 
     raters = df["rater"].unique()
     models = df["model"].unique()

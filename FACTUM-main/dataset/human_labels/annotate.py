@@ -19,23 +19,26 @@ class Color:
     END = "\033[0m"
 
 
+HUMAN_LABELS_DIR = os.path.dirname(os.path.abspath(__file__))
+NEUCLIR_DIR = os.path.join(os.path.dirname(HUMAN_LABELS_DIR), "NeuCLIR24")
+
 FILE_PAIRS = [
     {
         "name": "llama3.1-8b",
-        "resp": "citation-hallucination/FACTUM-main/dataset/NeuCLIR24/llama3.1-8b_neuclir24_response.jsonl",
-        "src": "citation-hallucination/FACTUM-main/dataset/NeuCLIR24/llama3.1-8b_neuclir24_source_info.jsonl",
+        "resp": os.path.join(NEUCLIR_DIR, "llama3.1-8b_neuclir24_response.jsonl"),
+        "src": os.path.join(NEUCLIR_DIR, "llama3.1-8b_neuclir24_source_info.jsonl"),
     },
     {
         "name": "llama3.2-3b",
-        "resp": "citation-hallucination/FACTUM-main/dataset/NeuCLIR24/llama3.2-3b_neuclir24_response.jsonl",
-        "src": "citation-hallucination/FACTUM-main/dataset/NeuCLIR24/llama3.2-3b_neuclir24_source_info.jsonl",
+        "resp": os.path.join(NEUCLIR_DIR, "llama3.2-3b_neuclir24_response.jsonl"),
+        "src": os.path.join(NEUCLIR_DIR, "llama3.2-3b_neuclir24_source_info.jsonl"),
     },
 ]
 
 SAMPLES_PER_MODEL = 50
 TOTAL_TARGET = SAMPLES_PER_MODEL * len(FILE_PAIRS)
 SEED = 42
-OUTPUT_FILE = "human_annotations.csv"
+OUTPUT_FILE = os.path.join(HUMAN_LABELS_DIR, "human_annotations.csv")
 
 STOP_WORDS = {
     "the",
