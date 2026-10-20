@@ -110,7 +110,7 @@ elif args.model_name == "llama3.1-8b":
 elif args.model_name == "llama2-7b":
     model_path = "meta-llama/Llama-2-7b-chat-hf"
 else:
-    ValueError(
+    raise ValueError(
         f"[ERROR] No model was found, adjust the 'model_path' to your downloaded model path"
     )
 
