@@ -102,6 +102,11 @@ parser.add_argument(
     action="store_true",
     help="Calculate attention entropy and top-k attended positions for each response token.",
 )
+parser.add_argument(
+    "--keep_uniform",
+    action="store_true",
+    help="Also score records whose labelled citations all share the same label. By default these records are skipped.",
+)
 
 args = parser.parse_args()
 
@@ -387,7 +392,7 @@ for item in tqdm(responses, desc="Overall Progress"):
     tqdm.write("[INFO] Pre-calculating context hidden states...")
 
     unique_labels = set(labeled_token_map.values())
-    if len(unique_labels) <= 1:
+    if not args.keep_uniform and len(unique_labels) <= 1:
         tqdm.write(
             f"[INFO] Skipping source_id {item['source_id']} because all of its labels are identical ({list(unique_labels)}). This provides no contrast for analysis."
         )
