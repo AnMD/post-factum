@@ -55,6 +55,13 @@ parser.add_argument(
     help="Chunk size for processing long context hidden states and prompt KV-cache.",
 )
 parser.add_argument(
+    "--ref_hs_mode",
+    type=str,
+    choices=["prefix", "upstream"],
+    default="prefix",
+    help="How the context and prompt hidden states used by CAS and ECS are computed. 'prefix': taken from the cached forward pass over the full prefix. 'upstream': context and prompt re-encoded in independent chunks without KV cache (original behaviour).",
+)
+parser.add_argument(
     "--response_chunk_size",
     type=int,
     default=64,
@@ -386,52 +393,54 @@ for item in tqdm(responses, desc="Overall Progress"):
         )
         continue
 
-    # Pre-calculate hidden states for the entire context: efficient for long-contexts
-    context_hs_all_layers = [[] for _ in range(model.config.num_hidden_layers + 1)]
-    with torch.no_grad():
-        for chunk_start_ctx in range(0, context_len, args.chunk_size):
-            end_pos = min(chunk_start_ctx + args.chunk_size, context_len)
-            chunk_ids_ctx = context_ids[:, chunk_start_ctx:end_pos]
-            chunk_outputs = model(
-                input_ids=chunk_ids_ctx.to(model.device),
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            for layer_idx in range(len(chunk_outputs.hidden_states)):
-                context_hs_all_layers[layer_idx].append(
-                    chunk_outputs.hidden_states[layer_idx].cpu()
+    if args.ref_hs_mode == "upstream":
+        # Pre-calculate hidden states for the entire context: efficient for long-contexts
+        context_hs_all_layers = [[] for _ in range(model.config.num_hidden_layers + 1)]
+        with torch.no_grad():
+            for chunk_start_ctx in range(0, context_len, args.chunk_size):
+                end_pos = min(chunk_start_ctx + args.chunk_size, context_len)
+                chunk_ids_ctx = context_ids[:, chunk_start_ctx:end_pos]
+                chunk_outputs = model(
+                    input_ids=chunk_ids_ctx.to(model.device),
+                    output_hidden_states=True,
+                    return_dict=True,
                 )
-            del chunk_outputs
-            torch.cuda.empty_cache()
-    context_hs_per_layer = tuple(
-        torch.cat(layer_hs, dim=1) for layer_hs in context_hs_all_layers
-    )
-    tqdm.write("[INFO] Context hidden states pre-calculated successfully.")
+                for layer_idx in range(len(chunk_outputs.hidden_states)):
+                    context_hs_all_layers[layer_idx].append(
+                        chunk_outputs.hidden_states[layer_idx].cpu()
+                    )
+                del chunk_outputs
+                torch.cuda.empty_cache()
+        context_hs_per_layer = tuple(
+            torch.cat(layer_hs, dim=1) for layer_hs in context_hs_all_layers
+        )
+        tqdm.write("[INFO] Context hidden states pre-calculated successfully.")
 
-    # Pre-calculate hidden states for the entire prompt: This is needed for long-contexts/prompts
-    tqdm.write("[INFO] Pre-calculating prompt hidden states...")
-    prompt_hs_all_layers = [[] for _ in range(model.config.num_hidden_layers + 1)]
-    with torch.no_grad():
-        for chunk_start_hs in range(0, prefix_len, args.chunk_size):
-            end_pos = min(chunk_start_hs + args.chunk_size, prefix_len)
-            chunk_ids_hs = prefix_ids[:, chunk_start_hs:end_pos]
-            chunk_outputs = model(
-                input_ids=chunk_ids_hs.to(model.device),
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            for layer_idx in range(len(chunk_outputs.hidden_states)):
-                prompt_hs_all_layers[layer_idx].append(
-                    chunk_outputs.hidden_states[layer_idx].cpu()
+        # Pre-calculate hidden states for the entire prompt: This is needed for long-contexts/prompts
+        tqdm.write("[INFO] Pre-calculating prompt hidden states...")
+        prompt_hs_all_layers = [[] for _ in range(model.config.num_hidden_layers + 1)]
+        with torch.no_grad():
+            for chunk_start_hs in range(0, prefix_len, args.chunk_size):
+                end_pos = min(chunk_start_hs + args.chunk_size, prefix_len)
+                chunk_ids_hs = prefix_ids[:, chunk_start_hs:end_pos]
+                chunk_outputs = model(
+                    input_ids=chunk_ids_hs.to(model.device),
+                    output_hidden_states=True,
+                    return_dict=True,
                 )
-            del chunk_outputs
-            torch.cuda.empty_cache()
-    prompt_hs_per_layer = tuple(
-        torch.cat(layer_hs, dim=1) for layer_hs in prompt_hs_all_layers
-    )
-    tqdm.write("[INFO] Prompt hidden states pre-calculated successfully.")
+                for layer_idx in range(len(chunk_outputs.hidden_states)):
+                    prompt_hs_all_layers[layer_idx].append(
+                        chunk_outputs.hidden_states[layer_idx].cpu()
+                    )
+                del chunk_outputs
+                torch.cuda.empty_cache()
+        prompt_hs_per_layer = tuple(
+            torch.cat(layer_hs, dim=1) for layer_hs in prompt_hs_all_layers
+        )
+        tqdm.write("[INFO] Prompt hidden states pre-calculated successfully.")
 
     past_key_values = None
+    prefix_hs_all_layers = [[] for _ in range(model.config.num_hidden_layers + 1)]
     with torch.no_grad():
         for chunk_start_kv in tqdm(
             range(0, prefix_len, args.chunk_size), desc="Prefix KV", leave=False
@@ -443,11 +452,27 @@ for item in tqdm(responses, desc="Overall Progress"):
                 input_ids=chunk_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
+                output_hidden_states=args.ref_hs_mode == "prefix",
                 return_dict=True,
             )
             past_key_values = cache_outputs.past_key_values
+            if args.ref_hs_mode == "prefix":
+                for layer_idx in range(len(cache_outputs.hidden_states)):
+                    prefix_hs_all_layers[layer_idx].append(
+                        cache_outputs.hidden_states[layer_idx].cpu()
+                    )
             del cache_outputs
             torch.cuda.empty_cache()
+
+    if args.ref_hs_mode == "prefix":
+        prompt_hs_per_layer = tuple(
+            torch.cat(layer_hs, dim=1) for layer_hs in prefix_hs_all_layers
+        )
+        context_hs_per_layer = tuple(
+            layer_hs[:, context_start_idx:context_end_idx]
+            for layer_hs in prompt_hs_per_layer
+        )
+    del prefix_hs_all_layers
 
     # Main response processing loop
     for chunk_start in tqdm(
