@@ -576,17 +576,20 @@ def run_final_cv_and_analysis(
 
         # Balance the training set for this fold using downsampling
         train_df_fold = pd.concat([X_train_per_layer, y_train.rename("label")], axis=1)
-        minority_class = train_df_fold[train_df_fold["label"] == 1]
-        majority_class = train_df_fold[train_df_fold["label"] == 0]
-        if len(minority_class) == 0:
+        class_0 = train_df_fold[train_df_fold["label"] == 0]
+        class_1 = train_df_fold[train_df_fold["label"] == 1]
+        if len(class_0) == 0 or len(class_1) == 0:
             continue
-        majority_downsampled = resample(
-            majority_class,
-            replace=False,
-            n_samples=len(minority_class),
-            random_state=args.seed,
-        )
-        train_df_balanced = pd.concat([minority_class, majority_downsampled])
+        n_balanced = min(len(class_0), len(class_1))
+        if len(class_0) > n_balanced:
+            class_0 = resample(
+                class_0, replace=False, n_samples=n_balanced, random_state=args.seed
+            )
+        if len(class_1) > n_balanced:
+            class_1 = resample(
+                class_1, replace=False, n_samples=n_balanced, random_state=args.seed
+            )
+        train_df_balanced = pd.concat([class_1, class_0])
         X_train_balanced_per_layer, y_train_balanced = (
             train_df_balanced.drop("label", axis=1),
             train_df_balanced["label"],
