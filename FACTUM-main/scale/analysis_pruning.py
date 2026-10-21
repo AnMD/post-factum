@@ -119,6 +119,12 @@ def config():
         "--n_jobs", type=int, default=-1, help="Number of folds run in parallel."
     )
     parser.add_argument(
+        "--dump_agg",
+        type=str,
+        default="",
+        help="If set, write the held-out aggregate features of every fold for FACTUM (Ours 2) to this directory (agg_<model>_fold<k>.csv), used by directional_bootstrap.py.",
+    )
+    parser.add_argument(
         "--skip_plots",
         action="store_true",
         help="Skip the qualitative plots and component selection report (Stages 6 and 7).",
@@ -789,6 +795,20 @@ def run_single_fold(
             ]
             if not final_feature_list:
                 continue
+            if args.dump_agg and combo_name == "Ours 2":
+                os.makedirs(args.dump_agg, exist_ok=True)
+                dump_df = X_test_pruned_agg.copy()
+                dump_df["label"] = y_test.to_numpy()
+                dump_df["source_id"] = report_ids.reindex(dump_df.index).to_numpy()
+                dump_df["fold"] = fold_id
+                dump_df["selected"] = json.dumps(list(final_feature_list))
+                dump_df.to_csv(
+                    os.path.join(
+                        args.dump_agg,
+                        "agg_%s_fold%d.csv" % (model_name.replace(" ", ""), fold_id),
+                    ),
+                    index=False,
+                )
 
             current_model = clone(model)
             current_model.fit(
