@@ -227,8 +227,11 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        output_residual: Optional[bool] = False,
+        output_gpa_states: Optional[bool] = False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        x_input = hidden_states if output_gpa_states else None
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -245,16 +248,22 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
             **kwargs,
         )
         hidden_states = residual + hidden_states
+        x_pre_ffn = hidden_states if output_gpa_states else None
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        ffn_contribution = hidden_states
+        hidden_states = residual + ffn_contribution
 
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
+        if output_residual:
+            outputs += (residual,)
+        if output_gpa_states:
+            outputs += ({"input": x_input, "pre_ffn": x_pre_ffn, "ffn_update": ffn_contribution},)
 
         return outputs
 
@@ -361,6 +370,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        output_residual: Optional[bool] = False,
+        output_gpa_states: Optional[bool] = False,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -423,6 +434,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        all_residuals = () if output_residual else None
+        all_gpa_states = () if output_gpa_states else None
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
@@ -437,13 +450,22 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                output_residual=output_residual,
+                output_gpa_states=output_gpa_states,
                 **flash_attn_kwargs,
             )
 
             hidden_states = layer_outputs[0]
 
+            output_idx = 1
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[output_idx],)
+                output_idx += 1
+            if output_residual:
+                all_residuals += (layer_outputs[output_idx],)
+                output_idx += 1
+            if output_gpa_states:
+                all_gpa_states += (layer_outputs[output_idx],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -451,12 +473,17 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutputWithPast(
+        output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+        if output_residual:
+            output.residuals = all_residuals
+        if output_gpa_states:
+            output.gpa_states = all_gpa_states
+        return output
 
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
@@ -510,6 +537,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        knowledge_layers: Optional[list] = None,
+        output_gpa_states: Optional[bool] = False,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -540,6 +569,15 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        is_gpa_mode = output_gpa_states
+        is_pks_mode = knowledge_layers is not None
+        if is_gpa_mode:
+            output_attentions = True
+            output_hidden_states = True
+        output_residual = True if is_pks_mode else False
+
+        model_kwargs = {k: v for k, v in kwargs.items()
+                        if k not in ("knowledge_layers", "output_gpa_states", "output_residual")}
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -550,8 +588,56 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
-            **kwargs,
+            output_residual=output_residual,
+            output_gpa_states=output_gpa_states,
+            **model_kwargs,
         )
+
+        def _pks_logits_dict(layers):
+            d = {}
+            hs_tuple = outputs.hidden_states
+            res_tuple = getattr(outputs, "residuals", None)
+            if res_tuple is None:
+                raise ValueError("knowledge_layers requires output_residual=True but no residuals returned.")
+            for layer in layers:
+                is_last = (layer + 1) == len(hs_tuple) - 1
+                cur = hs_tuple[layer + 1]
+                lg = self.lm_head(cur if is_last else self.model.norm(cur))
+                res_lg = self.lm_head(self.model.norm(res_tuple[layer]))
+                d[layer] = (lg, res_lg)
+            return d
+
+        if is_gpa_mode and is_pks_mode:
+            gpa_states = getattr(outputs, "gpa_states", None)
+            if gpa_states is None:
+                raise ValueError("output_gpa_states=True but no gpa_states returned.")
+            custom_outputs = {"gpa_states": gpa_states, "pks_logits": _pks_logits_dict(knowledge_layers)}
+            logits = self.lm_head(outputs.last_hidden_state).float()
+            final_outputs = CausalLMOutputWithPast(
+                loss=None, logits=logits, past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states, attentions=outputs.attentions,
+            )
+            return custom_outputs, final_outputs
+
+        if is_gpa_mode and not is_pks_mode:
+            gpa_states = getattr(outputs, "gpa_states", None)
+            if gpa_states is None:
+                raise ValueError("output_gpa_states=True but no gpa_states returned.")
+            logits = self.lm_head(outputs.last_hidden_state).float()
+            final_outputs = CausalLMOutputWithPast(
+                loss=None, logits=logits, past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states, attentions=outputs.attentions,
+            )
+            return gpa_states, final_outputs
+
+        if is_pks_mode and not is_gpa_mode:
+            logits_dict = _pks_logits_dict(knowledge_layers)
+            logits = self.lm_head(outputs.last_hidden_state).float()
+            final_outputs = CausalLMOutputWithPast(
+                loss=None, logits=logits, past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states, attentions=outputs.attentions,
+            )
+            return logits_dict, final_outputs
 
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
