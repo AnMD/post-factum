@@ -28,6 +28,7 @@ from sklearn.model_selection import (
     train_test_split,
     RepeatedStratifiedKFold,
     StratifiedKFold,
+    StratifiedGroupKFold,
     cross_val_score,
 )
 from sklearn.linear_model import LogisticRegression
@@ -537,6 +538,7 @@ def get_feature_importances(model, feature_names):
 def run_final_cv_and_analysis(
     X_per_layer_full,
     y_full,
+    groups,
     models,
     dream_teams,
     k,
@@ -545,16 +547,20 @@ def run_final_cv_and_analysis(
     args,
 ):
     """
-    Runs the main 10x10 repeated stratified cross-validation.
+    Runs the main 10x10 repeated stratified cross-validation, grouped by report
+    so that all citations of a report fall in either the train or the test split.
     On each fold, it performs top-k pruning on the train set, builds aggregate features,
     trains the models, and evaluates on the test set.
     Collects and returns test fold data for qualitative analysis.
     """
     print(f"\n--- Stage 4 (k={k}%): Running Final 10x10 CV with On-the-Fly Pruning ---")
     n_splits, n_repeats = 10, 10
-    rskf = RepeatedStratifiedKFold(
-        n_splits=n_splits, n_repeats=n_repeats, random_state=args.seed
-    )
+    splits = []
+    for repeat in range(n_repeats):
+        sgkf = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=args.seed + repeat
+        )
+        splits.extend(sgkf.split(X_per_layer_full, y_full, groups))
 
     all_scores = defaultdict(lambda: defaultdict(list))
     all_importances_list = []
@@ -562,7 +568,7 @@ def run_final_cv_and_analysis(
     all_holdout_data = defaultdict(list)  
 
     pbar = tqdm(
-        rskf.split(X_per_layer_full, y_full),
+        splits,
         total=n_splits * n_repeats,
         desc=f"Overall CV Progress for k={k}%",
     )
@@ -573,6 +579,8 @@ def run_final_cv_and_analysis(
             X_per_layer_full.iloc[test_idx],
         )
         y_train, y_test = y_full.iloc[train_idx], y_full.iloc[test_idx]
+        if y_test.nunique() < 2:
+            continue
 
         # Balance the training set for this fold using downsampling
         train_df_fold = pd.concat([X_train_per_layer, y_train.rename("label")], axis=1)
@@ -1193,6 +1201,8 @@ if __name__ == "__main__":
     print("Loading all data for the pipeline...")
     full_df = load_full_imbalanced_data(args.results_file, cpu_count(), SEED)
     X_per_layer_full, y_full, NUM_LAYERS, NUM_HEADS = create_per_layer_features(full_df)
+    groups = full_df["source_id"].reset_index(drop=True)
+    assert len(groups) == len(X_per_layer_full)
 
     # Create dev split for feature selection
     X_per_layer_dev, _, y_dev, _ = train_test_split(
@@ -1227,6 +1237,7 @@ if __name__ == "__main__":
         run_final_cv_and_analysis(
             X_per_layer_full,
             y_full,
+            groups,
             models,
             dream_teams,
             k,
