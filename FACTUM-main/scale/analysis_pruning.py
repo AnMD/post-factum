@@ -45,6 +45,7 @@ from sklearn.utils import resample
 import lightgbm as lgb
 from interpret.glassbox import ExplainableBoostingClassifier
 from joblib import Parallel, delayed
+from significance import COLUMNS as SIGNIFICANCE_COLUMNS, run_tests
 
 
 # ==============================================================================
@@ -931,73 +932,23 @@ def run_final_cv_and_analysis(
 
 
 def report_significance_and_importances(
-    all_scores, all_importances_df, models, output_dir
+    fold_score_rows, all_importances_df, n_splits, output_dir
 ):
     """
-    Performs statistical tests to compare model combinations and aggregates
-    feature importances, saving both as reports.
+    Compares the feature combinations with the Nadeau-Bengio corrected resampled t-test
+    (two-sided, Benjamini-Hochberg corrected per classifier; see significance.py) and
+    aggregates feature importances, saving both as reports.
     """
     print("\n--- Stage 5: Performing Statistical Analysis and Reporting ---")
 
-    final_results = []
-    metrics = ["AUC", "PCC", "Precision", "Recall", "F1"]
-
-    # Define all pairwise comparisons to be made
-    comparisons_to_make = [
-        ("Baseline", "Ours 1"),
-        ("Baseline", "Ours 2"),
-        ("Ours 1", "Ours 2"), 
-    ]
-
-    for model_name in models.keys():
-        model_tests = []
-        for base_combo, comp_combo in comparisons_to_make:
-            for metric in metrics:
-                base_scores = all_scores.get((model_name, base_combo), {}).get(
-                    metric, []
-                )
-                comp_scores = all_scores.get((model_name, comp_combo), {}).get(
-                    metric, []
-                )
-
-                if (
-                    not base_scores
-                    or not comp_scores
-                    or len(base_scores) != len(comp_scores)
-                ):
-                    continue
-                
-                # Use paired t-test for significance
-                t_stat, p_value = ttest_rel(
-                    comp_scores, base_scores, alternative="greater"
-                )
-                model_tests.append(
-                    {
-                        "Metric": metric,
-                        "Comparison": f"{comp_combo} vs. {base_combo}",
-                        "Mean_Baseline_Score": np.mean(base_scores),
-                        "Mean_Comparison_Score": np.mean(comp_scores),
-                        "P_Value_raw": p_value,
-                    }
-                )
-
-        # Perform Benjamini/Hochberg correction on all p-values for the current model
-        if model_tests:
-            raw_p_values = [test["P_Value_raw"] for test in model_tests]
-            is_significant_bh, p_corrected, _, _ = multipletests(
-                raw_p_values, alpha=0.05, method="fdr_bh"
-            )
-            for i, test in enumerate(model_tests):
-                test.update(
-                    {
-                        "P_Value_BH_Corrected": p_corrected[i],
-                        "Is_Significant_BH": "Yes" if is_significant_bh[i] else "No",
-                        "Classifier": model_name,
-                    }
-                )
-                final_results.append(test)
-
-    final_report_df = pd.DataFrame(final_results)
+    fold_scores = defaultdict(dict)
+    for row in fold_score_rows:
+        fold_scores[(row["classifier"], row["combo"], row["metric"])][
+            (0, row["fold"])
+        ] = float(row["value"])
+    final_report_df = pd.DataFrame(
+        run_tests(fold_scores, n_splits), columns=SIGNIFICANCE_COLUMNS
+    )
 
     # Feature importance processing
     avg_importances_df = pd.DataFrame()
@@ -1510,7 +1461,7 @@ if __name__ == "__main__":
         )
 
     final_report_df, avg_importances_df = report_significance_and_importances(
-        all_scores, avg_importances_df, models, k_output_dir
+        fold_score_rows, avg_importances_df, args.n_splits, k_output_dir
     )
     if not final_report_df.empty:
         save_path = os.path.join(k_output_dir, "report_final_significance.csv")
