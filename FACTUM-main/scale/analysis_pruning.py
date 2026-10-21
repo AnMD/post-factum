@@ -89,6 +89,13 @@ def config():
         help="Cross-validation groups. 'report': one group per source_id. 'topic': generations of the same topic (source_ids '335' and '335_1') share a group.",
     )
     parser.add_argument(
+        "--agg_mode",
+        type=str,
+        choices=["perlayer", "upstream"],
+        default="perlayer",
+        help="Aggregation of the per-head / per-layer scores. 'perlayer': heads are aggregated within each layer before the statistics over layers (as described in the paper). 'upstream': all selected components of a score are treated as one series (original behaviour).",
+    )
+    parser.add_argument(
         "--n_splits", type=int, default=10, help="Number of cross-validation folds."
     )
     parser.add_argument(
@@ -274,7 +281,7 @@ def create_per_layer_features(df: pd.DataFrame):
     )
 
 
-def create_aggregate_features(df_per_layer: pd.DataFrame):
+def create_aggregate_features_upstream(df_per_layer: pd.DataFrame):
     """Creates aggregate features (mean, std, etc.) from per-layer features."""
     if df_per_layer.empty:
         return pd.DataFrame()
@@ -320,6 +327,85 @@ def create_aggregate_features(df_per_layer: pd.DataFrame):
         return pd.DataFrame()
 
     return pd.concat(all_feature_dfs, axis=1).fillna(0)
+
+
+AGG_MODE = "perlayer"
+AGG_NUM_LAYERS = None
+COMPONENT_COLUMN_RE = re.compile(r"^(.*)_layer_(\d+)(?:_head_(\d+))?$")
+
+
+def create_aggregate_features_perlayer(df_per_layer: pd.DataFrame):
+    """
+    Creates aggregate features as described in the paper: head-level scores are first
+    aggregated within each layer (mean and std over the heads of that layer), giving one
+    value per layer; mean, std, max, the slope over the layer index and FFT magnitudes are
+    then computed over the layers. Layers without retained components are linearly
+    interpolated on the full layer grid.
+    """
+    if df_per_layer.empty:
+        return pd.DataFrame()
+    components = {}
+    for col in df_per_layer.columns:
+        match = COMPONENT_COLUMN_RE.match(col)
+        if not match:
+            continue
+        key, layer, head = match.group(1), int(match.group(2)), match.group(3)
+        components.setdefault((key, head is not None), {}).setdefault(layer, []).append(
+            (int(head) if head is not None else 0, col)
+        )
+    num_layers = AGG_NUM_LAYERS or (
+        max(layer for by_layer in components.values() for layer in by_layer) + 1
+    )
+    grid = np.arange(num_layers, dtype=float)
+    features = {}
+    for (key, is_head), by_layer in sorted(components.items()):
+        layers = sorted(by_layer)
+        if len(layers) < 1:
+            continue
+        if is_head:
+            layer_values = [
+                df_per_layer[[col for _, col in sorted(by_layer[layer])]].to_numpy(float)
+                for layer in layers
+            ]
+            series = {
+                "lmean": np.stack([v.mean(axis=1) for v in layer_values], axis=1),
+                "lstd": np.stack([v.std(axis=1) for v in layer_values], axis=1),
+            }
+        else:
+            series = {
+                "lval": np.stack(
+                    [df_per_layer[by_layer[layer][0][1]].to_numpy(float) for layer in layers],
+                    axis=1,
+                )
+            }
+        layer_positions = np.asarray(layers, float)
+        for series_name, values in series.items():
+            on_grid = np.stack(
+                [np.interp(grid, layer_positions, values[i]) for i in range(values.shape[0])],
+                axis=0,
+            )
+            base = "%s_%s_" % (key, series_name)
+            features[base + "mean"] = on_grid.mean(axis=1)
+            features[base + "std"] = (
+                on_grid.std(axis=1, ddof=1) if num_layers > 1 else np.zeros(on_grid.shape[0])
+            )
+            features[base + "max"] = on_grid.max(axis=1)
+            features[base + "slope"] = (
+                np.polyfit(grid, on_grid.T, 1)[0]
+                if num_layers > 1
+                else np.zeros(on_grid.shape[0])
+            )
+            fft_magnitudes = np.abs(np.fft.rfft(on_grid, axis=1))
+            for i in range(1, 7):
+                if fft_magnitudes.shape[1] > i:
+                    features[base + "fft_mag_%d" % i] = fft_magnitudes[:, i]
+    return pd.DataFrame(features, index=df_per_layer.index).fillna(0)
+
+
+def create_aggregate_features(df_per_layer: pd.DataFrame):
+    if AGG_MODE == "perlayer":
+        return create_aggregate_features_perlayer(df_per_layer)
+    return create_aggregate_features_upstream(df_per_layer)
 
 
 # ==============================================================================
@@ -575,6 +661,13 @@ def run_single_fold(
     "Dream Team" selection on the train set, training, and evaluation on the test set.
     Returns the per-model records and the component selections of this fold.
     """
+    global AGG_MODE, AGG_NUM_LAYERS
+    AGG_MODE = args.agg_mode
+    AGG_NUM_LAYERS = 1 + max(
+        int(match.group(2))
+        for match in (COMPONENT_COLUMN_RE.match(col) for col in X_per_layer_full.columns)
+        if match
+    )
     records, selections = [], []
     X_train_per_layer, X_test_per_layer = (
         X_per_layer_full.iloc[train_idx],
@@ -1303,6 +1396,7 @@ if __name__ == "__main__":
     print("Loading all data for the pipeline...")
     full_df = load_full_imbalanced_data(args.results_file, cpu_count(), SEED)
     X_per_layer_full, y_full, NUM_LAYERS, NUM_HEADS = create_per_layer_features(full_df)
+    AGG_MODE, AGG_NUM_LAYERS = args.agg_mode, NUM_LAYERS
     report_ids = full_df["source_id"].reset_index(drop=True)
     groups = report_ids
     if args.group_by == "topic":
