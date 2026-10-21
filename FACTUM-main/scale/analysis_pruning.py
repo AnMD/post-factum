@@ -23,7 +23,13 @@ import ruptures as rpt
 
 from itertools import combinations
 from statsmodels.stats.multitest import multipletests
-from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    roc_auc_score,
+    roc_curve,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import (
     train_test_split,
     RepeatedStratifiedKFold,
@@ -94,6 +100,13 @@ def config():
         choices=["perlayer", "upstream"],
         default="perlayer",
         help="Aggregation of the per-head / per-layer scores. 'perlayer': heads are aggregated within each layer before the statistics over layers (as described in the paper). 'upstream': all selected components of a score are treated as one series (original behaviour).",
+    )
+    parser.add_argument(
+        "--threshold_policy",
+        type=str,
+        choices=["youden_oof", "fixed05"],
+        default="youden_oof",
+        help="Decision threshold for Precision/Recall/F1. 'youden_oof': Youden-J threshold from grouped inner cross-validation on the training fold. 'fixed05': 0.5 (original behaviour). Both are also saved as *@youden and *@0.5.",
     )
     parser.add_argument(
         "--n_splits", type=int, default=10, help="Number of cross-validation folds."
@@ -643,12 +656,39 @@ def get_feature_importances(model, feature_names):
     return pd.DataFrame()
 
 
+def youden_threshold_oof(model, X_train, y_train, groups_train, seed, n_splits=5):
+    """
+    Youden-J decision threshold from out-of-fold predictions of a grouped inner
+    cross-validation on the training data (the test fold is never used).
+    Falls back to 0.5 when the inner cross-validation cannot provide enough predictions.
+    """
+    y = np.asarray(y_train)
+    oof = np.full(len(y), np.nan)
+    try:
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        for inner_train, inner_test in sgkf.split(X_train, y, np.asarray(groups_train)):
+            if len(np.unique(y[inner_train])) < 2:
+                continue
+            inner_model = clone(model).fit(X_train.iloc[inner_train], y[inner_train])
+            oof[inner_test] = inner_model.predict_proba(X_train.iloc[inner_test])[:, 1]
+    except Exception:
+        return 0.5
+    valid = ~np.isnan(oof)
+    if valid.sum() < 10 or len(np.unique(y[valid])) < 2:
+        return 0.5
+    fpr, tpr, thresholds = roc_curve(y[valid], oof[valid])
+    youden_j = tpr - fpr
+    youden_j[~np.isfinite(thresholds)] = -1
+    return float(thresholds[int(np.argmax(youden_j))])
+
+
 def run_single_fold(
     fold_id,
     train_idx,
     test_idx,
     X_per_layer_full,
     y_full,
+    groups,
     report_ids,
     models,
     k,
@@ -756,7 +796,16 @@ def run_single_fold(
             probas = current_model.predict_proba(
                 X_test_pruned_agg[final_feature_list]
             )[:, 1]
-            preds = (probas > 0.5).astype(int)
+            preds_05 = (probas > 0.5).astype(int)
+            threshold_youden = youden_threshold_oof(
+                model,
+                X_train_pruned_agg[final_feature_list],
+                y_train_balanced,
+                groups.reindex(X_train_pruned_agg.index),
+                args.seed,
+            )
+            preds_youden = (probas > threshold_youden).astype(int)
+            preds = preds_youden if args.threshold_policy == "youden_oof" else preds_05
 
             # Store scores
             scores = {
@@ -765,6 +814,13 @@ def run_single_fold(
                 "Precision": precision_score(y_test, preds, zero_division=0),
                 "Recall": recall_score(y_test, preds, zero_division=0),
                 "F1": f1_score(y_test, preds, zero_division=0),
+                "Precision@0.5": precision_score(y_test, preds_05, zero_division=0),
+                "Recall@0.5": recall_score(y_test, preds_05, zero_division=0),
+                "F1@0.5": f1_score(y_test, preds_05, zero_division=0),
+                "Precision@youden": precision_score(y_test, preds_youden, zero_division=0),
+                "Recall@youden": recall_score(y_test, preds_youden, zero_division=0),
+                "F1@youden": f1_score(y_test, preds_youden, zero_division=0),
+                "Thr_youden": threshold_youden,
             }
 
             # Store feature importances
@@ -836,6 +892,7 @@ def run_final_cv_and_analysis(
             test_idx,
             X_per_layer_full,
             y_full,
+            groups,
             report_ids,
             models,
             k,
