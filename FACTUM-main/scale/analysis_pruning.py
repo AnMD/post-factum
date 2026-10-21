@@ -38,6 +38,7 @@ from sklearn.base import clone
 from sklearn.utils import resample
 import lightgbm as lgb
 from interpret.glassbox import ExplainableBoostingClassifier
+from joblib import Parallel, delayed
 
 
 # ==============================================================================
@@ -86,6 +87,20 @@ def config():
         choices=["topic", "report"],
         default="topic",
         help="Cross-validation groups. 'report': one group per source_id. 'topic': generations of the same topic (source_ids '335' and '335_1') share a group.",
+    )
+    parser.add_argument(
+        "--n_splits", type=int, default=10, help="Number of cross-validation folds."
+    )
+    parser.add_argument(
+        "--n_repeats", type=int, default=10, help="Number of cross-validation repeats."
+    )
+    parser.add_argument(
+        "--n_jobs", type=int, default=-1, help="Number of folds run in parallel."
+    )
+    parser.add_argument(
+        "--skip_plots",
+        action="store_true",
+        help="Skip the qualitative plots and component selection report (Stages 6 and 7).",
     )
     return parser.parse_args()
 
@@ -542,10 +557,13 @@ def get_feature_importances(model, feature_names):
     return pd.DataFrame()
 
 
-def run_final_cv_and_analysis(
+def run_single_fold(
+    fold_id,
+    train_idx,
+    test_idx,
     X_per_layer_full,
     y_full,
-    groups,
+    report_ids,
     models,
     k,
     FEATURE_CONCEPT_PREFIXES,
@@ -553,15 +571,158 @@ def run_final_cv_and_analysis(
     args,
 ):
     """
-    Runs the main 10x10 repeated stratified cross-validation, grouped by report
-    so that all citations of a report fall in either the train or the test split.
-    On each fold, it performs top-k pruning on the train set, builds aggregate features,
-    selects the "Dream Team" features on the train set, trains the models, and evaluates
-    on the test set.
+    Runs one cross-validation fold: top-k pruning on the train set, aggregate features,
+    "Dream Team" selection on the train set, training, and evaluation on the test set.
+    Returns the per-model records and the component selections of this fold.
+    """
+    records, selections = [], []
+    X_train_per_layer, X_test_per_layer = (
+        X_per_layer_full.iloc[train_idx],
+        X_per_layer_full.iloc[test_idx],
+    )
+    y_train, y_test = y_full.iloc[train_idx], y_full.iloc[test_idx]
+    if y_test.nunique() < 2:
+        return records, selections
+
+    # Balance the training set for this fold using downsampling
+    train_df_fold = pd.concat([X_train_per_layer, y_train.rename("label")], axis=1)
+    class_0 = train_df_fold[train_df_fold["label"] == 0]
+    class_1 = train_df_fold[train_df_fold["label"] == 1]
+    if len(class_0) == 0 or len(class_1) == 0:
+        return records, selections
+    n_balanced = min(len(class_0), len(class_1))
+    if len(class_0) > n_balanced:
+        class_0 = resample(
+            class_0, replace=False, n_samples=n_balanced, random_state=args.seed
+        )
+    if len(class_1) > n_balanced:
+        class_1 = resample(
+            class_1, replace=False, n_samples=n_balanced, random_state=args.seed
+        )
+    train_df_balanced = pd.concat([class_1, class_0])
+    X_train_balanced_per_layer, y_train_balanced = (
+        train_df_balanced.drop("label", axis=1),
+        train_df_balanced["label"],
+    )
+
+    for model_name, model in models.items():
+        for combo_name, concepts_in_combo in feature_sets_to_build.items():
+            feature_concepts_subset = {
+                c: p
+                for c, p in FEATURE_CONCEPT_PREFIXES.items()
+                if c in concepts_in_combo
+            }
+
+            # Perform pruning based on the balanced training data for this fold
+            selected_components = select_top_k_components(
+                X_train_balanced_per_layer,
+                y_train_balanced,
+                k,
+                feature_concepts_subset,
+            )
+            selections.append(selected_components)
+
+            # Create aggregate features from the pruned components
+            X_train_pruned_agg = create_pruned_aggregate_features(
+                X_train_balanced_per_layer, selected_components
+            )
+            X_test_pruned_agg = create_pruned_aggregate_features(
+                X_test_per_layer, selected_components
+            )
+            if X_train_pruned_agg.empty or X_test_pruned_agg.empty:
+                continue
+
+            candidate_features = get_candidate_shortlist(
+                X_train_pruned_agg,
+                y_train_balanced,
+                {model_name: model},
+                feature_concepts_subset,
+                top_n=5,
+            )
+            dream_team_features = find_dream_team_features(
+                X_train_pruned_agg,
+                y_train_balanced,
+                model,
+                candidate_features[model_name],
+                concepts_in_combo,
+            )
+
+            final_feature_list = [
+                f
+                for f in dream_team_features
+                if f in X_train_pruned_agg.columns
+                and f in X_test_pruned_agg.columns
+            ]
+            if not final_feature_list:
+                continue
+
+            current_model = clone(model)
+            current_model.fit(
+                X_train_pruned_agg[final_feature_list], y_train_balanced
+            )
+            probas = current_model.predict_proba(
+                X_test_pruned_agg[final_feature_list]
+            )[:, 1]
+            preds = (probas > 0.5).astype(int)
+
+            # Store scores
+            scores = {
+                "AUC": roc_auc_score(y_test, probas),
+                "PCC": pearsonr(y_test, probas)[0],
+                "Precision": precision_score(y_test, preds, zero_division=0),
+                "Recall": recall_score(y_test, preds, zero_division=0),
+                "F1": f1_score(y_test, preds, zero_division=0),
+            }
+
+            # Store feature importances
+            imp_df = get_feature_importances(current_model, final_feature_list)
+            if imp_df.empty:
+                imp_df = None
+            else:
+                imp_df["model"], imp_df["combo"] = model_name, combo_name
+
+            # Store minimal holdout data for plotting
+            holdout_fold_df = X_test_pruned_agg[final_feature_list].copy()
+            holdout_fold_df["label"] = y_test
+            holdout_fold_df["probability"] = probas
+            holdout_fold_df["source_id"] = report_ids.reindex(
+                holdout_fold_df.index
+            ).to_numpy()
+            holdout_fold_df["_row"] = holdout_fold_df.index.to_numpy()
+            records.append(
+                {
+                    "key": (model_name, combo_name),
+                    "fold": fold_id,
+                    "scores": scores,
+                    "imp": imp_df,
+                    "holdout": holdout_fold_df,
+                }
+            )
+
+    return records, selections
+
+
+def run_final_cv_and_analysis(
+    X_per_layer_full,
+    y_full,
+    groups,
+    report_ids,
+    models,
+    k,
+    FEATURE_CONCEPT_PREFIXES,
+    feature_sets_to_build,
+    args,
+):
+    """
+    Runs the main repeated stratified cross-validation (10x10 by default), grouped by
+    report so that all citations of a report fall in either the train or the test split.
+    The folds are independent and run in parallel (see run_single_fold).
     Collects and returns test fold data for qualitative analysis.
     """
-    print(f"\n--- Stage 4 (k={k}%): Running Final 10x10 CV with On-the-Fly Pruning ---")
-    n_splits, n_repeats = 10, 10
+    n_splits, n_repeats = args.n_splits, args.n_repeats
+    print(
+        f"\n--- Stage 4 (k={k}%): Running Final {n_splits}x{n_repeats} CV with On-the-Fly Pruning ---"
+    )
     splits = []
     for repeat in range(n_repeats):
         sgkf = StratifiedGroupKFold(
@@ -572,131 +733,50 @@ def run_final_cv_and_analysis(
     all_scores = defaultdict(lambda: defaultdict(list))
     all_importances_list = []
     all_selections_list = []
-    all_holdout_data = defaultdict(list)  
+    all_holdout_data = defaultdict(list)
+    fold_score_rows = []
 
-    pbar = tqdm(
-        splits,
-        total=n_splits * n_repeats,
-        desc=f"Overall CV Progress for k={k}%",
+    fold_outputs = Parallel(n_jobs=args.n_jobs, verbose=5)(
+        delayed(run_single_fold)(
+            fold_id,
+            train_idx,
+            test_idx,
+            X_per_layer_full,
+            y_full,
+            report_ids,
+            models,
+            k,
+            FEATURE_CONCEPT_PREFIXES,
+            feature_sets_to_build,
+            args,
+        )
+        for fold_id, (train_idx, test_idx) in enumerate(splits)
     )
-
-    for train_idx, test_idx in pbar:
-        X_train_per_layer, X_test_per_layer = (
-            X_per_layer_full.iloc[train_idx],
-            X_per_layer_full.iloc[test_idx],
-        )
-        y_train, y_test = y_full.iloc[train_idx], y_full.iloc[test_idx]
-        if y_test.nunique() < 2:
-            continue
-
-        # Balance the training set for this fold using downsampling
-        train_df_fold = pd.concat([X_train_per_layer, y_train.rename("label")], axis=1)
-        class_0 = train_df_fold[train_df_fold["label"] == 0]
-        class_1 = train_df_fold[train_df_fold["label"] == 1]
-        if len(class_0) == 0 or len(class_1) == 0:
-            continue
-        n_balanced = min(len(class_0), len(class_1))
-        if len(class_0) > n_balanced:
-            class_0 = resample(
-                class_0, replace=False, n_samples=n_balanced, random_state=args.seed
-            )
-        if len(class_1) > n_balanced:
-            class_1 = resample(
-                class_1, replace=False, n_samples=n_balanced, random_state=args.seed
-            )
-        train_df_balanced = pd.concat([class_1, class_0])
-        X_train_balanced_per_layer, y_train_balanced = (
-            train_df_balanced.drop("label", axis=1),
-            train_df_balanced["label"],
-        )
-
-        for model_name, model in models.items():
-            for combo_name, concepts_in_combo in feature_sets_to_build.items():
-                feature_concepts_subset = {
-                    c: p
-                    for c, p in FEATURE_CONCEPT_PREFIXES.items()
-                    if c in concepts_in_combo
-                }
-
-                # Perform pruning based on the balanced training data for this fold
-                selected_components = select_top_k_components(
-                    X_train_balanced_per_layer,
-                    y_train_balanced,
-                    k,
-                    feature_concepts_subset,
+    for records, selections in fold_outputs:
+        all_selections_list.extend(selections)
+        for record in records:
+            fold_scores = all_scores[record["key"]]
+            for metric, value in record["scores"].items():
+                fold_scores[metric].append(value)
+                fold_score_rows.append(
+                    {
+                        "classifier": record["key"][0],
+                        "combo": record["key"][1],
+                        "metric": metric,
+                        "fold": record["fold"],
+                        "value": value,
+                    }
                 )
-                all_selections_list.append(selected_components)
-
-                # Create aggregate features from the pruned components
-                X_train_pruned_agg = create_pruned_aggregate_features(
-                    X_train_balanced_per_layer, selected_components
-                )
-                X_test_pruned_agg = create_pruned_aggregate_features(
-                    X_test_per_layer, selected_components
-                )
-                if X_train_pruned_agg.empty or X_test_pruned_agg.empty:
-                    continue
-
-                candidate_features = get_candidate_shortlist(
-                    X_train_pruned_agg,
-                    y_train_balanced,
-                    {model_name: model},
-                    feature_concepts_subset,
-                    top_n=5,
-                )
-                dream_team_features = find_dream_team_features(
-                    X_train_pruned_agg,
-                    y_train_balanced,
-                    model,
-                    candidate_features[model_name],
-                    concepts_in_combo,
-                )
-
-                final_feature_list = [
-                    f
-                    for f in dream_team_features
-                    if f in X_train_pruned_agg.columns
-                    and f in X_test_pruned_agg.columns
-                ]
-                if not final_feature_list:
-                    continue
-
-                current_model = clone(model)
-                current_model.fit(
-                    X_train_pruned_agg[final_feature_list], y_train_balanced
-                )
-                probas = current_model.predict_proba(
-                    X_test_pruned_agg[final_feature_list]
-                )[:, 1]
-                preds = (probas > 0.5).astype(int)
-
-                # Store scores
-                scores = all_scores[(model_name, combo_name)]
-                scores["AUC"].append(roc_auc_score(y_test, probas))
-                scores["PCC"].append(pearsonr(y_test, probas)[0])
-                scores["Precision"].append(
-                    precision_score(y_test, preds, zero_division=0)
-                )
-                scores["Recall"].append(recall_score(y_test, preds, zero_division=0))
-                scores["F1"].append(f1_score(y_test, preds, zero_division=0))
-
-                # Store feature importances
-                imp_df = get_feature_importances(current_model, final_feature_list)
-                if not imp_df.empty:
-                    imp_df["model"], imp_df["combo"] = model_name, combo_name
-                    all_importances_list.append(imp_df)
-
-                # Store minimal holdout data for plotting
-                holdout_fold_df = X_test_pruned_agg[final_feature_list].copy()
-                holdout_fold_df["label"] = y_test
-                holdout_fold_df["probability"] = probas
-                all_holdout_data[(model_name, combo_name)].append(holdout_fold_df)
+            if record["imp"] is not None:
+                all_importances_list.append(record["imp"])
+            all_holdout_data[record["key"]].append(record["holdout"])
 
     return (
         all_scores,
         pd.concat(all_importances_list) if all_importances_list else pd.DataFrame(),
         all_selections_list,
         all_holdout_data,
+        fold_score_rows,
     )
 
 
@@ -1191,11 +1271,13 @@ if __name__ == "__main__":
             ]
         ),
         "LightGBM": lgb.LGBMClassifier(
-            random_state=SEED, class_weight="balanced", verbose=-1
+            random_state=SEED, class_weight="balanced", verbose=-1, n_jobs=1
         ),
     }
     if args.run_ebm:
-        models["EBM"] = ExplainableBoostingClassifier(random_state=SEED, interactions=0)
+        models["EBM"] = ExplainableBoostingClassifier(
+            random_state=SEED, interactions=0, n_jobs=1
+        )
 
     FEATURE_CONCEPT_PREFIXES = {
         "cas": "cas_alt_vs_final_layer_per_head",
@@ -1221,17 +1303,19 @@ if __name__ == "__main__":
     print("Loading all data for the pipeline...")
     full_df = load_full_imbalanced_data(args.results_file, cpu_count(), SEED)
     X_per_layer_full, y_full, NUM_LAYERS, NUM_HEADS = create_per_layer_features(full_df)
-    groups = full_df["source_id"].reset_index(drop=True)
+    report_ids = full_df["source_id"].reset_index(drop=True)
+    groups = report_ids
     if args.group_by == "topic":
-        groups = groups.map(lambda sid: str(sid).split("_")[0].split("~")[0])
+        groups = report_ids.map(lambda sid: str(sid).split("_")[0].split("~")[0])
     assert len(groups) == len(X_per_layer_full)
 
     # Stage 4 & 5: Run final CV on the full dataset, get scores, importances, significance, and holdout data
-    all_scores, avg_importances_df, all_selections, all_holdout_data = (
+    all_scores, avg_importances_df, all_selections, all_holdout_data, fold_score_rows = (
         run_final_cv_and_analysis(
             X_per_layer_full,
             y_full,
             groups,
+            report_ids,
             models,
             k,
             FEATURE_CONCEPT_PREFIXES,
@@ -1239,6 +1323,41 @@ if __name__ == "__main__":
             args,
         )
     )
+
+    holdout_rows = []
+    for (model_name, combo_name), holdout_dfs in all_holdout_data.items():
+        for holdout_df in holdout_dfs:
+            if "token_index" in full_df.columns:
+                token_indices = (
+                    full_df["token_index"].reindex(holdout_df["_row"]).to_numpy()
+                )
+            else:
+                token_indices = [-1] * len(holdout_df)
+            for source_id, label, probability, token_index in zip(
+                holdout_df["source_id"],
+                holdout_df["label"],
+                holdout_df["probability"],
+                token_indices,
+            ):
+                holdout_rows.append(
+                    {
+                        "classifier": model_name,
+                        "combo": combo_name,
+                        "source_id": source_id,
+                        "label": int(label),
+                        "probability": float(probability),
+                        "token_index": int(token_index),
+                    }
+                )
+    if holdout_rows:
+        pd.DataFrame(holdout_rows).to_csv(
+            os.path.join(k_output_dir, "holdout_predictions.csv"), index=False
+        )
+    if fold_score_rows:
+        pd.DataFrame(fold_score_rows).to_csv(
+            os.path.join(k_output_dir, "fold_scores.csv"), index=False
+        )
+
     final_report_df, avg_importances_df = report_significance_and_importances(
         all_scores, avg_importances_df, models, k_output_dir
     )
@@ -1248,20 +1367,21 @@ if __name__ == "__main__":
         print("\n--- Final Performance Report ---")
         print(final_report_df.to_string())
 
-    # Stage 6: Qualitative Analysis using the data collected from the CV folds
-    run_qualitative_analysis(
-        all_holdout_data=all_holdout_data,
-        avg_importances_df=avg_importances_df,
-        k=k,
-        top_n_confident=args.top_n_confident,
-        output_dir=k_output_dir,
-        FEATURE_CONCEPT_PREFIXES=FEATURE_CONCEPT_PREFIXES,
-        args=args,
-    )
+    if not args.skip_plots:
+        # Stage 6: Qualitative Analysis using the data collected from the CV folds
+        run_qualitative_analysis(
+            all_holdout_data=all_holdout_data,
+            avg_importances_df=avg_importances_df,
+            k=k,
+            top_n_confident=args.top_n_confident,
+            output_dir=k_output_dir,
+            FEATURE_CONCEPT_PREFIXES=FEATURE_CONCEPT_PREFIXES,
+            args=args,
+        )
 
-    # Stage 7: Analyze and visualize component selections
-    stage7_report_and_visualize_selections(
-        all_selections, FEATURE_CONCEPT_PREFIXES, k, k_output_dir, NUM_LAYERS, NUM_HEADS
-    )
+        # Stage 7: Analyze and visualize component selections
+        stage7_report_and_visualize_selections(
+            all_selections, FEATURE_CONCEPT_PREFIXES, k, k_output_dir, NUM_LAYERS, NUM_HEADS
+        )
 
     print(f"\n{'=' * 80}\nCOMPLETED FULL ANALYSIS PIPELINE FOR k = {k}%\n{'=' * 80}")
