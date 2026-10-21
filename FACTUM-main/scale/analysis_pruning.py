@@ -80,6 +80,13 @@ def config():
         required=True,
         help="The single pruning percentage (e.g., 10, 25) to run.",
     )
+    parser.add_argument(
+        "--group_by",
+        type=str,
+        choices=["topic", "report"],
+        default="topic",
+        help="Cross-validation groups. 'report': one group per source_id. 'topic': generations of the same topic (source_ids '335' and '335_1') share a group.",
+    )
     return parser.parse_args()
 
 
@@ -1202,6 +1209,8 @@ if __name__ == "__main__":
     full_df = load_full_imbalanced_data(args.results_file, cpu_count(), SEED)
     X_per_layer_full, y_full, NUM_LAYERS, NUM_HEADS = create_per_layer_features(full_df)
     groups = full_df["source_id"].reset_index(drop=True)
+    if args.group_by == "topic":
+        groups = groups.map(lambda sid: str(sid).split("_")[0].split("~")[0])
     assert len(groups) == len(X_per_layer_full)
 
     # Create dev split for feature selection
