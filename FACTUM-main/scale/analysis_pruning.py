@@ -547,7 +547,6 @@ def run_final_cv_and_analysis(
     y_full,
     groups,
     models,
-    dream_teams,
     k,
     FEATURE_CONCEPT_PREFIXES,
     feature_sets_to_build,
@@ -557,7 +556,8 @@ def run_final_cv_and_analysis(
     Runs the main 10x10 repeated stratified cross-validation, grouped by report
     so that all citations of a report fall in either the train or the test split.
     On each fold, it performs top-k pruning on the train set, builds aggregate features,
-    trains the models, and evaluates on the test set.
+    selects the "Dream Team" features on the train set, trains the models, and evaluates
+    on the test set.
     Collects and returns test fold data for qualitative analysis.
     """
     print(f"\n--- Stage 4 (k={k}%): Running Final 10x10 CV with On-the-Fly Pruning ---")
@@ -611,11 +611,7 @@ def run_final_cv_and_analysis(
         )
 
         for model_name, model in models.items():
-            for combo_name, dream_team_features in dream_teams[model_name].items():
-                if not dream_team_features:
-                    continue
-
-                concepts_in_combo = feature_sets_to_build[combo_name]
+            for combo_name, concepts_in_combo in feature_sets_to_build.items():
                 feature_concepts_subset = {
                     c: p
                     for c, p in FEATURE_CONCEPT_PREFIXES.items()
@@ -637,6 +633,23 @@ def run_final_cv_and_analysis(
                 )
                 X_test_pruned_agg = create_pruned_aggregate_features(
                     X_test_per_layer, selected_components
+                )
+                if X_train_pruned_agg.empty or X_test_pruned_agg.empty:
+                    continue
+
+                candidate_features = get_candidate_shortlist(
+                    X_train_pruned_agg,
+                    y_train_balanced,
+                    {model_name: model},
+                    feature_concepts_subset,
+                    top_n=5,
+                )
+                dream_team_features = find_dream_team_features(
+                    X_train_pruned_agg,
+                    y_train_balanced,
+                    model,
+                    candidate_features[model_name],
+                    concepts_in_combo,
                 )
 
                 final_feature_list = [
@@ -1213,34 +1226,6 @@ if __name__ == "__main__":
         groups = groups.map(lambda sid: str(sid).split("_")[0].split("~")[0])
     assert len(groups) == len(X_per_layer_full)
 
-    # Create dev split for feature selection
-    X_per_layer_dev, _, y_dev, _ = train_test_split(
-        X_per_layer_full, y_full, test_size=0.2, random_state=SEED, stratify=y_full
-    )
-    X_agg_dev = create_aggregate_features(X_per_layer_dev)
-    X_agg_full = create_aggregate_features(X_per_layer_full)  # For validation report
-
-    # Stage 1A: Rank all raw components on the dev set
-    stage1a_rank_all_components(X_per_layer_dev, y_dev, k_output_dir)
-
-    # Stage 1 & 2: Find the "Dream Team" features using the dev set
-    candidate_features = get_candidate_shortlist(
-        X_agg_dev, y_dev, models, FEATURE_CONCEPT_PREFIXES, top_n=5
-    )
-    dream_teams = defaultdict(dict)
-    for model_name, model in models.items():
-        for combo_name, concepts in feature_sets_to_build.items():
-            dream_teams[model_name][combo_name] = find_dream_team_features(
-                X_agg_dev, y_dev, model, candidate_features[model_name], concepts
-            )
-    with open(os.path.join(k_output_dir, "report_dream_teams.json"), "w") as f:
-        json.dump(dream_teams, f, indent=4)
-
-    # Stage 3: Validate the selected features on the full dataset
-    validate_dream_teams(
-        dream_teams, X_agg_full, y_full, k_output_dir, FEATURE_CONCEPT_PREFIXES
-    )
-
     # Stage 4 & 5: Run final CV on the full dataset, get scores, importances, significance, and holdout data
     all_scores, avg_importances_df, all_selections, all_holdout_data = (
         run_final_cv_and_analysis(
@@ -1248,7 +1233,6 @@ if __name__ == "__main__":
             y_full,
             groups,
             models,
-            dream_teams,
             k,
             FEATURE_CONCEPT_PREFIXES,
             feature_sets_to_build,
